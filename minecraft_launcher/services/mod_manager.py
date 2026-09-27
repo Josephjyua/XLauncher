@@ -1,7 +1,10 @@
 import os
 import shutil
 import logging
+import platform
+import subprocess
 from pathlib import Path
+from ..platform_support import external_process_environment
 
 
 class ModManager:
@@ -52,4 +55,10 @@ class ModManager:
         logging.getLogger(__name__).info('Mod eliminado: %s', name)
 
     def open_folder(self):
-        os.startfile(self.enabled)
+        with external_process_environment() as environment:
+            if platform.system() == 'Windows':
+                os.startfile(self.enabled)
+            else:
+                command = 'open' if platform.system() == 'Darwin' else 'xdg-open'
+                subprocess.Popen([command, str(self.enabled)], env=environment,
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

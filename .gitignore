@@ -2,3 +2,7 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+.venv-build/
+build/
+dist/
+__pyinstaller/

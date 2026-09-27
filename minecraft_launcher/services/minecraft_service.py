@@ -12,6 +12,8 @@ from minecraft_launcher_lib.mod_loader import get_mod_loader
 
 from .java_manager import get_required_java_major
 from ..config import validate_username, memory_limit
+from .. import __version__
+from ..platform_support import external_process_environment
 
 
 class JavaRequired(ValueError):
@@ -125,8 +127,9 @@ class MinecraftService:
                 loader_version = mod_loader.get_latest_loader_version(version)
                 installed = mod_loader.get_installed_version(version, loader_version)
                 marker = mark(installed)
-                mod_loader.install(version, str(self.paths.root), loader_version=loader_version,
-                                   callback=callback, java=str(java.path))
+                with external_process_environment():
+                    mod_loader.install(version, str(self.paths.root), loader_version=loader_version,
+                                       callback=callback, java=str(java.path))
                 marker.unlink()
             logging.getLogger(__name__).info('Instalación completada: %s (%s)', installed, loader)
             return installed
@@ -147,12 +150,13 @@ class MinecraftService:
         options = {'username': config.username, 'uuid': str(offline_uuid), 'token': '',
                    'executablePath': str(java.path), 'gameDirectory': str(self.paths.root),
                    'jvmArguments': ['-Xms512M', f'-Xmx{config.memory_gb}G'],
-                   'launcherName': 'XLauncher', 'launcherVersion': '0.1.0'}
+                   'launcherName': 'XLauncher', 'launcherVersion': __version__}
         command = mll.command.get_minecraft_command(config.selected_version, str(self.paths.root), options)
         log = self.paths.root / 'logs' / f'minecraft-{datetime.now():%Y%m%d-%H%M%S-%f}.log'
-        with log.open('wb') as output:
+        with log.open('wb') as output, external_process_environment() as environment:
             self.process = subprocess.Popen(command, cwd=self.paths.root, stdout=output, stderr=subprocess.STDOUT,
                                             stdin=subprocess.DEVNULL,
+                                            env=environment,
                                             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         logging.getLogger(__name__).info('Minecraft iniciado: %s, Java %s', config.selected_version, java.major_version)
         return self.process, log

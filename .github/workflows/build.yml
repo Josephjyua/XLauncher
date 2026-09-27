@@ -1,0 +1,85 @@
+name: Build XLauncher
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.artifact }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: XLauncher-Windows-x86_64
+            arch: x64
+          - os: ubuntu-latest
+            artifact: XLauncher-Linux-x86_64
+            arch: x64
+          - os: macos-latest
+            artifact: XLauncher-macOS-arm64
+            arch: arm64
+          - os: macos-15-intel
+            artifact: XLauncher-macOS-x86_64
+            arch: x64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: ${{ matrix.arch }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+            constraints-build.txt
+      - name: Linux GUI dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y python3-tk xvfb xauth libx11-6 libxext6 libxrender1 libfontconfig1
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt -c constraints-build.txt
+      - name: Compile modules
+        run: python -m compileall -q main.py minecraft_launcher tests
+      - name: Test (Linux virtual display)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a python -m pytest -q
+      - name: Test (Windows and macOS)
+        if: runner.os != 'Linux'
+        run: python -m pytest -q
+      - name: Build native application
+        run: python -m PyInstaller --noconfirm --clean XLauncher.spec
+      - name: Smoke test (Linux virtual display)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a python scripts/check_bundle.py dist/XLauncher/XLauncher
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        run: python scripts/check_bundle.py dist/XLauncher/XLauncher.exe
+      - name: Smoke test (macOS)
+        if: runner.os == 'macOS'
+        run: python scripts/check_bundle.py dist/XLauncher.app/Contents/MacOS/XLauncher
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path dist/XLauncher -DestinationPath dist/${{ matrix.artifact }}.zip
+      - name: Package Linux (preserve permissions)
+        if: runner.os == 'Linux'
+        run: tar -czf dist/${{ matrix.artifact }}.tar.gz -C dist XLauncher
+      - name: Package macOS (preserve app bundle)
+        if: runner.os == 'macOS'
+        run: ditto -c -k --sequesterRsrc --keepParent dist/XLauncher.app dist/${{ matrix.artifact }}.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist/${{ matrix.artifact }}.zip
+            dist/${{ matrix.artifact }}.tar.gz
+          if-no-files-found: error
+          retention-days: 14

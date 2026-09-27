@@ -1,4 +1,3 @@
-"""
-Ejecucion del Launcher de Minecraft y
-instalacion de versiones y Forge
-"""
+"""XLauncher: graphical Minecraft launcher."""
+
+__version__ = '0.1.0'

@@ -2,6 +2,7 @@ from dataclasses import replace
 from tkinter import filedialog
 import customtkinter as ctk
 from ...config import memory_limit
+from ...platform_support import java_executable_name
 
 
 class SettingsPage(ctk.CTkFrame):
@@ -10,17 +11,18 @@ class SettingsPage(ctk.CTkFrame):
         self.app = app
         ctk.CTkLabel(self, text='Ajustes', font=ctk.CTkFont(size=26)).pack(pady=20)
         self.fields = {}
-        for key, label in [('username', 'Nombre del jugador (perfil local)'), ('memory_gb', f'RAM en GB (1–{memory_limit()})'), ('java_path', 'Java manual (opcional, java.exe)')]:
+        for key, label in [('username', 'Nombre del jugador (perfil local)'), ('memory_gb', f'RAM en GB (1–{memory_limit()})'), ('java_path', f'Java manual (opcional, {java_executable_name()})')]:
             ctk.CTkLabel(self, text=label).pack(pady=(10, 2))
             entry = ctk.CTkEntry(self, width=470)
             entry.pack(pady=4)
             self.fields[key] = entry
-        app.action(self, 'Buscar java.exe', self.browse).pack(pady=8)
+        app.action(self, f'Buscar {java_executable_name()}', self.browse).pack(pady=8)
         app.action(self, 'Guardar ajustes', self.save).pack(pady=8)
         ctk.CTkLabel(self, text='Deja Java vacío para detección automática.\nNo se guardan contraseñas ni tokens.').pack(pady=10)
 
     def browse(self):
-        path = filedialog.askopenfilename(parent=self, title='Selecciona java.exe', filetypes=[('Java', 'java.exe')])
+        executable = java_executable_name()
+        path = filedialog.askopenfilename(parent=self, title=f'Selecciona {executable}', filetypes=[('Java', executable)])
         if path:
             self.fields['java_path'].delete(0, 'end')
             self.fields['java_path'].insert(0, path)

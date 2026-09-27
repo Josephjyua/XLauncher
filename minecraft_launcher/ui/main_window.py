@@ -3,12 +3,16 @@ import queue
 import threading
 from dataclasses import replace
 from tkinter import messagebox
+import tkinter as tk
+import platform
 
 import customtkinter as ctk
 import requests
 from minecraft_launcher_lib.exceptions import UnsupportedVersion, VersionNotFound
 
 from ..services.minecraft_service import JavaRequired
+from .. import __version__
+from ..paths import resource_path
 from .pages.home_page import HomePage
 from .pages.installations_page import InstallationsPage
 from .pages.mods_page import ModsPage
@@ -16,7 +20,7 @@ from .pages.settings_page import SettingsPage
 
 
 class MainWindow(ctk.CTk):
-    def __init__(self, paths, config, java, minecraft, mods):
+    def __init__(self, paths, config, java, minecraft, mods, detect_java_on_start=True):
         super().__init__()
         self.paths, self.config, self.java_manager = paths, config, java
         self.minecraft, self.mods = minecraft, mods
@@ -28,6 +32,8 @@ class MainWindow(ctk.CTk):
         self.pending_progress = None
         self.progress_lock = threading.Lock()
         self.title('XLauncher')
+        self.app_version = __version__
+        self.after(300, self.apply_icon)
         self.geometry('980x700')
         self.minsize(850, 640)
         self.protocol('WM_DELETE_WINDOW', self.close)
@@ -54,9 +60,22 @@ class MainWindow(ctk.CTk):
             ctk.CTkButton(sidebar, text=name.upper(), command=lambda n=name: self.show(n)).pack(padx=10, pady=8)
         self.show('Jugar')
         self.after(80, self.poll_events)
-        self.after(150, self.detect_java)
+        if detect_java_on_start:
+            self.after(150, self.detect_java)
         if config.warning:
             self.after(250, lambda: messagebox.showwarning('Configuración recuperada', config.warning, parent=self))
+
+    def apply_icon(self):
+        try:
+            ico = resource_path('assets/icons/xlauncher.ico')
+            png = resource_path('assets/icons/xlauncher.png')
+            if platform.system() == 'Windows' and ico.is_file():
+                self.iconbitmap(str(ico))
+            elif png.is_file():
+                self._app_icon = tk.PhotoImage(file=str(png))
+                self.iconphoto(True, self._app_icon)
+        except (OSError, tk.TclError):
+            logging.getLogger(__name__).warning('No se pudo cargar el icono opcional de XLauncher.')
 
     def action(self, parent, text, command):
         button = ctk.CTkButton(parent, text=text, command=command, width=250)

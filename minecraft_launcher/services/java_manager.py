@@ -7,6 +7,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tarfile
 import tempfile
 import uuid
 import zipfile
@@ -15,6 +16,8 @@ from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
 import requests
+from ..paths import extra_java_candidates
+from ..platform_support import adoptium_target, java_executable_name, external_process_environment
 
 
 def parse_java_major(output):
@@ -82,6 +85,77 @@ def safe_extract_zip(archive, destination):
                     shutil.copyfileobj(source, output)
 
 
+def safe_extract_tar(archive, destination):
+    """Extract regular files/dirs, then validated internal links from Temurin TARs.
+
+    Reject special files, duplicate paths, link ancestors, traversal and unsafe
+    link targets. Never apply archive ownership, setuid or world-writable modes.
+    Destination must be a new empty staging directory.
+    """
+    destination = Path(destination).resolve()
+    destination.mkdir(parents=True, exist_ok=True)
+    if any(destination.iterdir()):
+        raise ValueError('La extracción de Java requiere una carpeta vacía.')
+
+    def target_path(name):
+        relative = PurePosixPath(name)
+        if (relative.is_absolute() or not relative.parts or '\\' in name
+                or any(part == '..' or ':' in part for part in relative.parts)):
+            raise ValueError('El TAR contiene una ruta insegura.')
+        target = destination.joinpath(*relative.parts).resolve()
+        if not target.is_relative_to(destination) or target == destination:
+            raise ValueError('El TAR contiene una ruta insegura.')
+        return target
+
+    with tarfile.open(archive, 'r:gz') as bundle:
+        members = bundle.getmembers()
+        if len(members) > 100_000 or sum(item.size for item in members) > 3 * 1024 ** 3:
+            raise ValueError('El archivo Java es demasiado grande.')
+        targets = {}
+        links = {}
+        for item in members:
+            target = target_path(item.name)
+            # Case-fold also protects case-insensitive macOS volumes.
+            key = str(target).casefold()
+            if key in targets or not (item.isfile() or item.isdir() or item.issym() or item.islnk()):
+                raise ValueError('El TAR contiene entradas duplicadas o especiales.')
+            targets[key] = (target, item)
+            if item.issym() or item.islnk():
+                link = PurePosixPath(item.linkname)
+                if link.is_absolute() or '\\' in item.linkname or ':' in item.linkname:
+                    raise ValueError('El TAR contiene un enlace inseguro.')
+                base = target.parent if item.issym() else destination
+                resolved = (base / Path(*link.parts)).resolve()
+                if not resolved.is_relative_to(destination):
+                    raise ValueError('El TAR contiene un enlace fuera del runtime.')
+                links[key] = resolved
+        for target, item in targets.values():
+            if any(str(parent).casefold() in links for parent in target.parents):
+                raise ValueError('El TAR utiliza un enlace como directorio de extracción.')
+        # Links must point directly to normal archive files/directories, not chains.
+        for key, resolved in links.items():
+            destination_key = str(resolved).casefold()
+            if destination_key not in targets or destination_key in links:
+                raise ValueError('El TAR contiene un enlace a un destino no verificable.')
+            if targets[key][1].islnk() and not targets[destination_key][1].isfile():
+                raise ValueError('El TAR contiene un enlace duro inválido.')
+        for target, item in targets.values():
+            if item.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+            elif item.isfile():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with bundle.extractfile(item) as source, target.open('xb') as output:
+                    shutil.copyfileobj(source, output)
+                target.chmod(item.mode & 0o755)
+        for key, resolved in links.items():
+            target, item = targets[key]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if item.issym():
+                target.symlink_to(os.path.relpath(resolved, target.parent), target_is_directory=resolved.is_dir())
+            else:
+                os.link(resolved, target)
+
+
 @dataclass(frozen=True)
 class JavaInstallation:
     path: Path
@@ -98,9 +172,10 @@ class JavaManager:
         if not path.is_file():
             return None
         try:
-            result = subprocess.run([str(path), '-version'], capture_output=True, text=True,
-                                    errors='replace', timeout=10,
-                                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            with external_process_environment() as environment:
+                result = subprocess.run([str(path.resolve()), '-version'], capture_output=True, text=True,
+                                        errors='replace', timeout=10, env=environment,
+                                        creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
             major = parse_java_major(result.stdout + result.stderr)
             if result.returncode == 0 and major:
                 return JavaInstallation(path.resolve(), major, source)
@@ -121,20 +196,17 @@ class JavaManager:
             except (OSError, ValueError, KeyError, TypeError):
                 continue
         if os.environ.get('JAVA_HOME'):
-            yield Path(os.environ['JAVA_HOME']) / 'bin' / 'java.exe', 'JAVA_HOME'
+            yield Path(os.environ['JAVA_HOME']) / 'bin' / java_executable_name(), 'JAVA_HOME'
         executable = shutil.which('java')
         if executable:
             yield Path(executable), 'PATH'
-        for variable in ('ProgramFiles', 'ProgramFiles(x86)'):
-            if os.environ.get(variable):
-                for vendor in ('Java', 'Eclipse Adoptium', 'Microsoft', 'Amazon Corretto'):
-                    for path in (Path(os.environ[variable]) / vendor).glob('*/bin/java.exe'):
-                        yield path, 'Detectado en Windows'
+        for path in extra_java_candidates():
+            yield path, f'Detectado en {platform.system()}'
 
     def find(self, required=None, manual=None):
         seen = set()
         for path, source in self.candidates(manual):
-            key = str(path).lower()
+            key = os.path.normcase(str(path))
             if key in seen:
                 continue
             seen.add(key)
@@ -145,16 +217,11 @@ class JavaManager:
         return None
 
     def install(self, major, progress):
-        if os.name != 'nt':
-            raise ValueError('El runtime privado está disponible únicamente en Windows.')
-        machine = platform.machine().lower()
-        architecture = {'amd64': 'x64', 'x86_64': 'x64', 'arm64': 'aarch64', 'aarch64': 'aarch64'}.get(machine)
-        if not architecture:
-            raise ValueError('La arquitectura de Windows no está soportada por el instalador de Java.')
+        operating_system, architecture, extension = adoptium_target()
         progress('Consultando Eclipse Adoptium…', None)
         # Official Adoptium v3 assets API; never synthesize a binary download URL.
         response = requests.get(f'https://api.adoptium.net/v3/assets/latest/{int(major)}/hotspot',
-                                params={'architecture': architecture, 'image_type': 'jdk', 'os': 'windows', 'vendor': 'eclipse'}, timeout=(15, 60))
+                                params={'architecture': architecture, 'image_type': 'jdk', 'os': operating_system, 'vendor': 'eclipse'}, timeout=(15, 60))
         response.raise_for_status()
         assets = response.json()
         if not isinstance(assets, list) or not assets:
@@ -164,11 +231,11 @@ class JavaManager:
         parsed = urlsplit(link)
         if (parsed.scheme != 'https' or parsed.hostname not in ('github.com', 'api.adoptium.net')
                 or (parsed.hostname == 'github.com' and not parsed.path.startswith('/adoptium/'))
-                or not parsed.path.lower().endswith('.zip') or not re.fullmatch('[0-9a-fA-F]{64}', checksum)):
+                or not parsed.path.lower().endswith(extension) or not re.fullmatch('[0-9a-fA-F]{64}', checksum)):
             raise ValueError('La API no devolvió un paquete Java verificable de una fuente admitida.')
         with tempfile.TemporaryDirectory(dir=self.paths.runtime, prefix='.staging-') as temp:
             staging = Path(temp)
-            archive = staging / 'java.zip'
+            archive = staging / ('java' + extension)
             digest = hashlib.sha256()
             received = 0
             with requests.get(link, stream=True, timeout=(15, 60)) as download:
@@ -189,8 +256,12 @@ class JavaManager:
             unpacked = staging / 'unpacked'
             unpacked.mkdir()
             progress('Verificando y extrayendo Java…', None)
-            safe_extract_zip(archive, unpacked)
-            candidates = list(unpacked.glob('*/bin/java.exe'))
+            if extension == '.zip':
+                safe_extract_zip(archive, unpacked)
+            else:
+                safe_extract_tar(archive, unpacked)
+            pattern = '*/Contents/Home/bin/java' if operating_system == 'mac' else f'*/bin/{java_executable_name()}'
+            candidates = list(unpacked.glob(pattern))
             java = self.inspect(candidates[0], 'Privado de XLauncher') if len(candidates) == 1 else None
             if java is None or java.major_version != major:
                 raise ValueError('El Java descargado no pasó la verificación de versión.')
